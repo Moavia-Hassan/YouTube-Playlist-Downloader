@@ -33,6 +33,7 @@ class DownloadWorker(QThread):
     status = pyqtSignal(str)
     finished = pyqtSignal()
     error = pyqtSignal(str)
+    detailed_progress = pyqtSignal(dict)  # New signal for detailed progress
 
     def __init__(self, url, save_path, format_id, num_videos, is_playlist=False):
         super().__init__()
@@ -41,16 +42,44 @@ class DownloadWorker(QThread):
         self.format_id = format_id
         self.num_videos = num_videos
         self.is_playlist = is_playlist
+        self.current_video = 0  # Track current video number
 
     def progress_hook(self, d):
         if d['status'] == 'downloading':
-            if 'total_bytes' in d:
-                percentage = (d['downloaded_bytes'] / d['total_bytes']) * 100
+            # Calculate speed and progress
+            speed = d.get('speed', 0)
+            speed_str = f"{speed/1024/1024:.1f} MB/s" if speed else "N/A"
+
+            # Get the total size first
+            total = d.get('total_bytes', 0)
+            if not total:
+                total = d.get('total_bytes_estimate', 0)
+
+            # Get downloaded bytes
+            downloaded = d.get('downloaded_bytes', 0)
+
+            # Format sizes consistently
+            downloaded_str = f"{downloaded/1024/1024:.1f}"
+            total_str = f"{total/1024/1024:.1f}" if total else 'N/A'
+
+            # Prepare progress information
+            progress_info = {
+                'speed': speed_str,
+                'downloaded': downloaded_str,  # Just the number without MB
+                'total': total_str,           # Just the number without MB
+                'video_num': self.current_video,
+                'filename': d.get('filename', '').split('/')[-1]
+            }
+
+            if total:
+                percentage = (downloaded / total) * 100
                 self.progress.emit(percentage)
-                self.status.emit(f"Downloading: {percentage:.1f}%")
-            elif 'downloaded_bytes' in d:
-                self.status.emit(f"Downloading... ({d['downloaded_bytes'] / 1024 / 1024:.1f} MB)")
+                progress_info['percent'] = f"{percentage:.1f}%"
+            
+            self.detailed_progress.emit(progress_info)
+            
         elif d['status'] == 'finished':
+            self.current_video += 1
             self.status.emit('Processing completed file...')
 
     def run(self):
@@ -358,20 +387,42 @@ class MainWindow(QMainWindow):
         progress_container.setProperty("class", "StepContainer")
         progress_layout = QVBoxLayout(progress_container)
         
+        # Initialize progress bar
         self.progress_bar = QProgressBar()
         self.progress_bar.setMinimumHeight(30)
-        self.status_label = QLabel('Ready')
+        
+        # Initialize status text area
         self.detailed_status = QTextEdit()
         self.detailed_status.setReadOnly(True)
         self.detailed_status.setMaximumHeight(100)
         
+        # Add detailed progress labels
+        progress_info_layout = QGridLayout()
+        self.speed_label = QLabel('Speed: N/A')
+        self.size_label = QLabel('Size: N/A')
+        self.video_progress_label = QLabel('Progress: N/A')
+        self.current_file_label = QLabel('Current File: N/A')
+        self.status_label = QLabel('Ready')
+        
+        progress_info_layout.addWidget(QLabel('Download Speed:'), 0, 0)
+        progress_info_layout.addWidget(self.speed_label, 0, 1)
+        progress_info_layout.addWidget(QLabel('File Size:'), 1, 0)
+        progress_info_layout.addWidget(self.size_label, 1, 1)
+        progress_info_layout.addWidget(QLabel('Progress:'), 2, 0)
+        progress_info_layout.addWidget(self.video_progress_label, 2, 1)
+        progress_info_layout.addWidget(QLabel('Current File:'), 3, 0)
+        progress_info_layout.addWidget(self.current_file_label, 3, 1)
+        progress_info_layout.addWidget(QLabel('Status:'), 4, 0)
+        progress_info_layout.addWidget(self.status_label, 4, 1)
+        
+        # Add all components to progress layout
         progress_layout.addWidget(self.progress_bar)
-        progress_layout.addWidget(self.status_label)
+        progress_layout.addLayout(progress_info_layout)
         progress_layout.addWidget(self.detailed_status)
         
         download_layout.addWidget(progress_container)
         download_layout.addStretch()
-        
+
         self.stack.addWidget(download_page)
 
         # Window setup
@@ -459,6 +510,7 @@ class MainWindow(QMainWindow):
         )
         self.worker.progress.connect(self.update_progress)
         self.worker.status.connect(self.update_status)
+        self.worker.detailed_progress.connect(self.update_detailed_progress)  # New connection
         self.worker.finished.connect(self.download_finished)
         self.worker.error.connect(self.download_error)
         self.worker.start()
@@ -484,6 +536,27 @@ class MainWindow(QMainWindow):
         self.detailed_status.verticalScrollBar().setValue(
             self.detailed_status.verticalScrollBar().maximum()
         )
+
+    def update_detailed_progress(self, progress_info):
+        """Update detailed progress information"""
+        self.speed_label.setText(f"{progress_info['speed']}")
+        
+        # Format the size display consistently
+        if progress_info['total'] != 'N/A':
+            size_text = f"{progress_info['downloaded']} / {progress_info['total']} MB"
+        else:
+            size_text = f"{progress_info['downloaded']} MB / Unknown size"
+        self.size_label.setText(size_text)
+        
+        if self.is_playlist:
+            video_progress = f"Video {progress_info['video_num'] + 1} of {self.count_input.value()}"
+            if 'percent' in progress_info:
+                video_progress += f" ({progress_info['percent']})"
+        else:
+            video_progress = progress_info.get('percent', 'N/A')
+            
+        self.video_progress_label.setText(video_progress)
+        self.current_file_label.setText(progress_info['filename'])
 
     def download_finished(self):
         self.download_btn.setEnabled(True)
@@ -563,6 +636,12 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.status_label.setText('Ready')
         self.detailed_status.clear()
+        
+        # Clear all progress information
+        self.speed_label.setText('Speed: N/A')
+        self.size_label.setText('Size: N/A')
+        self.video_progress_label.setText('Progress: N/A')
+        self.current_file_label.setText('Current File: N/A')
         
         # Reset to first step
         self.stack.setCurrentIndex(0)
