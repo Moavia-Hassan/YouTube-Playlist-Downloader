@@ -6,7 +6,7 @@ from PyQt5.QtGui import QFont, QIcon
 import yt_dlp
 
 class UrlValidator(QThread):
-    finished = pyqtSignal(bool, str, int)
+    finished = pyqtSignal(bool, str, int, list)  # Added list for video titles
     
     def __init__(self, url):
         super().__init__()
@@ -24,25 +24,41 @@ class UrlValidator(QThread):
                 is_playlist = 'entries' in info
                 title = info.get('title', '')
                 video_count = len(info['entries']) if is_playlist else 1
-                self.finished.emit(True, title, video_count)
+                
+                # Get video titles for playlist
+                video_titles = []
+                if is_playlist:
+                    for entry in info['entries']:
+                        video_titles.append(entry.get('title', 'Unknown Title'))
+                
+                self.finished.emit(True, title, video_count, video_titles)
         except Exception as e:
-            self.finished.emit(False, str(e), 0)
+            self.finished.emit(False, str(e), 0, [])
 
 class DownloadWorker(QThread):
     progress = pyqtSignal(float)
     status = pyqtSignal(str)
     finished = pyqtSignal()
-    error = pyqtSignal(str)
+    download_error = pyqtSignal(str)  # Renamed from error to download_error
     detailed_progress = pyqtSignal(dict)  # New signal for detailed progress
 
-    def __init__(self, url, save_path, format_id, num_videos, is_playlist=False):
+    def __init__(self, url, save_path, format_id, num_videos, start_index=1, end_index=None, is_playlist=False):
         super().__init__()
         self.url = url
         self.save_path = save_path
         self.format_id = format_id
         self.num_videos = num_videos
         self.is_playlist = is_playlist
+        self.start_index = start_index
+        self.end_index = end_index if end_index else num_videos
         self.current_video = 0  # Track current video number
+        self.last_progress = 0
+        self.smoothed_progress = 0
+        self.progress_history = []
+        self.current_video = 0
+        self.total_progress = 0
+        self.current_video_progress = 0
+        self.overall_progress = 0
 
     def progress_hook(self, d):
         if d['status'] == 'downloading':
@@ -50,54 +66,101 @@ class DownloadWorker(QThread):
             speed = d.get('speed', 0)
             speed_str = f"{speed/1024/1024:.1f} MB/s" if speed else "N/A"
 
-            # Get the total size first
-            total = d.get('total_bytes', 0)
-            if not total:
-                total = d.get('total_bytes_estimate', 0)
-
-            # Get downloaded bytes
+            # Get downloaded and total size
+            total = d.get('total_bytes', 0) or d.get('total_bytes_estimate', 0)
             downloaded = d.get('downloaded_bytes', 0)
 
-            # Format sizes consistently
-            downloaded_str = f"{downloaded/1024/1024:.1f}"
-            total_str = f"{total/1024/1024:.1f}" if total else 'N/A'
+            if total > 0:
+                # Calculate individual video progress
+                self.current_video_progress = (downloaded / total) * 100
+                
+                # Calculate overall progress for playlist
+                if self.is_playlist:
+                    video_weight = 100.0 / self.num_videos
+                    base_progress = self.current_video * video_weight
+                    current_part = (self.current_video_progress * video_weight) / 100
+                    self.overall_progress = base_progress + current_part
+                else:
+                    self.overall_progress = self.current_video_progress
 
-            # Prepare progress information
+                # Smooth progress updates
+                alpha = 0.1
+                self.smoothed_progress = (alpha * self.overall_progress + 
+                                        (1 - alpha) * self.last_progress)
+                self.last_progress = self.smoothed_progress
+                
+                self.progress.emit(self.smoothed_progress)
+                progress_str = f"{self.smoothed_progress:.1f}%"
+            else:
+                progress_str = "Calculating..."
+
+            # Format file size and time
+            total_size = f"{total/1024/1024:.1f} MB" if total else "Unknown"
+            downloaded_size = f"{downloaded/1024/1024:.1f}"
+            
+            # Calculate ETA
+            eta = d.get('eta', None)
+            if eta is not None:
+                m, s = divmod(eta, 60)
+                h, m = divmod(m, 60)
+                eta_str = f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+            else:
+                eta_str = "Calculating..."
+
+            # Get clean filename without path
+            filename = os.path.basename(d.get('filename', ''))
+            
+            # Update progress info
             progress_info = {
                 'speed': speed_str,
-                'downloaded': downloaded_str,  # Just the number without MB
-                'total': total_str,           # Just the number without MB
-                'video_num': self.current_video,
-                'filename': d.get('filename', '').split('/')[-1]
+                'downloaded': downloaded_size,
+                'total': total_size,
+                'video_num': self.current_video + 1,
+                'filename': filename,
+                'percent': progress_str,
+                'eta': eta_str,
+                'total_videos': self.num_videos
             }
-
-            if total:
-                percentage = (downloaded / total) * 100
-                self.progress.emit(percentage)
-                progress_info['percent'] = f"{percentage:.1f}%"
             
             self.detailed_progress.emit(progress_info)
             
         elif d['status'] == 'finished':
             self.current_video += 1
+            self.current_video_progress = 0
             self.status.emit('Processing completed file...')
 
     def run(self):
         try:
             ydl_opts = {
                 'format': self.format_id,
-                'outtmpl': os.path.join(self.save_path, '%(title)s.%(ext)s'),
+                'outtmpl': os.path.join(self.save_path, f'%(playlist_index)03d_%(title)s.%(ext)s' if self.is_playlist else '%(title)s.%(ext)s'),
                 'progress_hooks': [self.progress_hook],
                 'noplaylist': not self.is_playlist,
-                'playlist_items': f'1-{self.num_videos}' if self.is_playlist else None,
+                'playlist_items': f'{self.start_index}-{self.end_index}' if self.is_playlist else None,
+                'logger': self,  # Add this line
             }
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                self.status.emit('Starting download...')
                 ydl.download([self.url])
             
             self.finished.emit()
         except Exception as e:
-            self.error.emit(str(e))
+            self.download_error.emit(str(e))
+
+    # Add these methods for logging
+    def debug(self, msg):
+        if msg.strip():
+            self.status.emit(msg)
+
+    def warning(self, msg):
+        if msg.strip():
+            self.status.emit(f"Warning: {msg}")
+
+    def error(self, msg):
+        if msg.strip():
+            self.status.emit(f"Error: {msg}")
+            self.download_error.emit(msg)  # Use download_error signal instead
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -106,6 +169,7 @@ class MainWindow(QMainWindow):
         self.current_step = 0
         self.video_count = 0
         self.is_playlist = False
+        self.selected_count = 1  # Add this line to store selected count
 
     def initUI(self):
         self.setWindowTitle('YouTube Downloader')
@@ -345,9 +409,10 @@ class MainWindow(QMainWindow):
         download_page.setObjectName("step3")
         download_layout = QVBoxLayout(download_page)
         
-        options_container = QFrame()
-        options_container.setProperty("class", "StepContainer")
-        options_layout = QVBoxLayout(options_container)
+        # Options container (store reference)
+        self.options_container = QFrame()
+        self.options_container.setProperty("class", "StepContainer")
+        options_layout = QVBoxLayout(self.options_container)
         
         # Format selection
         format_label = QLabel('Select Format:')
@@ -380,49 +445,161 @@ class MainWindow(QMainWindow):
         options_layout.addLayout(location_layout)
         options_layout.addWidget(self.download_btn)
         
-        download_layout.addWidget(options_container)
+        download_layout.addWidget(self.options_container)
         
-        # Progress section
+        # Progress view with modern styling
+        self.progress_view = QFrame()
+        self.progress_view.setObjectName("downloadProgress")
+        self.progress_view.hide()
+        progress_layout = QVBoxLayout(self.progress_view)
+        progress_layout.setSpacing(15)
+        
+        # Download status header
+        status_container = QFrame()
+        status_container.setObjectName("statusContainer")
+        status_layout = QHBoxLayout(status_container)
+        self.status_label = QLabel("Ready to download")
+        self.status_label.setObjectName("statusLabel")
+        status_layout.addWidget(self.status_label)
+        progress_layout.addWidget(status_container)
+        
+        # File info and progress section
         progress_container = QFrame()
-        progress_container.setProperty("class", "StepContainer")
-        progress_layout = QVBoxLayout(progress_container)
+        progress_container.setObjectName("progressContainer")
+        progress_inner = QVBoxLayout(progress_container)
+        progress_inner.setSpacing(10)
         
-        # Initialize progress bar
+        # Current file label
+        self.current_file_label = QLabel()
+        self.current_file_label.setObjectName("fileLabel")
+        self.current_file_label.setWordWrap(True)
+        progress_inner.addWidget(self.current_file_label)
+        
+        # Progress bar with percentage
+        progress_bar_layout = QHBoxLayout()
         self.progress_bar = QProgressBar()
-        self.progress_bar.setMinimumHeight(30)
+        self.progress_bar.setTextVisible(False)
+        self.progress_percent = QLabel("0%")
+        self.progress_percent.setObjectName("percentLabel")
+        progress_bar_layout.addWidget(self.progress_bar, stretch=1)
+        progress_bar_layout.addWidget(self.progress_percent)
+        progress_inner.addLayout(progress_bar_layout)
         
-        # Initialize status text area
+        # Download statistics grid
+        stats_layout = QGridLayout()
+        stats_layout.setSpacing(10)
+        
+        # Add labels with modern styling
+        self.speed_label = QLabel("Speed: --")
+        self.time_label = QLabel("Time left: --:--")
+        self.size_label = QLabel("Size: --")
+        self.video_progress_label = QLabel("Progress: --")
+        
+        for label in [self.speed_label, self.time_label, self.size_label, self.video_progress_label]:
+            label.setObjectName("statsLabel")
+        
+        stats_layout.addWidget(self.speed_label, 0, 0)
+        stats_layout.addWidget(self.time_label, 0, 1)
+        stats_layout.addWidget(self.size_label, 1, 0)
+        stats_layout.addWidget(self.video_progress_label, 1, 1)
+        
+        progress_inner.addLayout(stats_layout)
+        progress_layout.addWidget(progress_container)
+        
+        # Log view with styled scrollbar
         self.detailed_status = QTextEdit()
+        self.detailed_status.setObjectName("logView")
         self.detailed_status.setReadOnly(True)
-        self.detailed_status.setMaximumHeight(100)
-        
-        # Add detailed progress labels
-        progress_info_layout = QGridLayout()
-        self.speed_label = QLabel('Speed: N/A')
-        self.size_label = QLabel('Size: N/A')
-        self.video_progress_label = QLabel('Progress: N/A')
-        self.current_file_label = QLabel('Current File: N/A')
-        self.status_label = QLabel('Ready')
-        
-        progress_info_layout.addWidget(QLabel('Download Speed:'), 0, 0)
-        progress_info_layout.addWidget(self.speed_label, 0, 1)
-        progress_info_layout.addWidget(QLabel('File Size:'), 1, 0)
-        progress_info_layout.addWidget(self.size_label, 1, 1)
-        progress_info_layout.addWidget(QLabel('Progress:'), 2, 0)
-        progress_info_layout.addWidget(self.video_progress_label, 2, 1)
-        progress_info_layout.addWidget(QLabel('Current File:'), 3, 0)
-        progress_info_layout.addWidget(self.current_file_label, 3, 1)
-        progress_info_layout.addWidget(QLabel('Status:'), 4, 0)
-        progress_info_layout.addWidget(self.status_label, 4, 1)
-        
-        # Add all components to progress layout
-        progress_layout.addWidget(self.progress_bar)
-        progress_layout.addLayout(progress_info_layout)
+        self.detailed_status.setMinimumHeight(200)
+        self.detailed_status.setStyleSheet("""
+            QTextEdit {
+                background-color: #1a1a1a;
+                border: none;
+                border-radius: 4px;
+                color: #00ff00;
+                font-family: 'Consolas', monospace;
+                padding: 10px;
+            }
+            QScrollBar:vertical {
+                background-color: #1a1a1a;
+                width: 10px;
+                border-radius: 5px;
+            }
+            QScrollBar::handle:vertical {
+                background-color: #404040;
+                min-height: 30px;
+                border-radius: 5px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background-color: #505050;
+            }
+        """)
         progress_layout.addWidget(self.detailed_status)
         
-        download_layout.addWidget(progress_container)
-        download_layout.addStretch()
+        download_layout.addWidget(self.progress_view)
+        
+        # Add modern progress view styles
+        self.setStyleSheet(self.styleSheet() + """
+            QFrame#downloadProgress {
+                background-color: #1a1a1a;
+                border-radius: 10px;
+                padding: 20px;
+            }
+            QFrame#statusContainer {
+                background-color: #232323;
+                border-radius: 8px;
+                padding: 15px;
+            }
+            QLabel#statusLabel {
+                color: #4dabf7;
+                font-size: 16px;
+                font-weight: bold;
+            }
+            QLabel#fileLabel {
+                color: #e9ecef;
+                font-size: 14px;
+                margin-bottom: 5px;
+            }
+            QLabel#percentLabel {
+                color: #4dabf7;
+                font-size: 16px;
+                font-weight: bold;
+                min-width: 60px;
+            }
+            QLabel#statsLabel {
+                color: #adb5bd;
+                font-size: 13px;
+            }
+            QProgressBar {
+                background-color: #232323;
+                border: none;
+                border-radius: 3px;
+                height: 6px;
+                text-align: center;
+                margin-top: 2px;
+                margin-bottom: 2px;
+            }
+            QProgressBar::chunk {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #4dabf7,
+                    stop:1 #228be6);
+                border-radius: 3px;
+            }
+            QTextEdit#logView {
+                background-color: #232323;
+                border: none;
+                border-radius: 8px;
+                color: #adb5bd;
+                font-family: 'Consolas', monospace;
+                font-size: 12px;
+                padding: 10px;
+                margin-top: 10px;
+            }
+        """)
 
+        download_layout.addWidget(self.progress_view)
+        download_layout.addStretch()
+        
         self.stack.addWidget(download_page)
 
         # Window setup
@@ -458,19 +635,19 @@ class MainWindow(QMainWindow):
         self.validator.finished.connect(self.handle_validation_result)
         self.validator.start()
 
-    def handle_validation_result(self, is_valid, title, count):
+    def handle_validation_result(self, is_valid, title, count, video_titles):
         self.validate_btn.setEnabled(True)
         self.validate_btn.setText('Validate URL')
         
         if is_valid:
             self.video_count = count
             self.is_playlist = count > 1
+            self.video_titles = video_titles
             self.video_info_label.setText(f"Found: {title}\n" +
                                         (f"Playlist with {count} videos" if self.is_playlist else "Single video"))
             
             if self.is_playlist:
-                self.count_input.setMaximum(count)
-                self.count_input.setValue(count)
+                self.setup_playlist_options(count, video_titles)
                 self.stack.setCurrentIndex(1)  # Show playlist options
             else:
                 self.count_input.setValue(1)
@@ -478,6 +655,85 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.warning(self, 'Error', f'Invalid URL: {title}')
 
+    def setup_playlist_options(self, count, video_titles):
+        # Clear existing widgets in playlist container
+        for i in reversed(range(self.stack.widget(1).layout().count())):
+            item = self.stack.widget(1).layout().itemAt(i)
+            if item.widget():
+                item.widget().deleteLater()
+
+        playlist_layout = QVBoxLayout()
+        
+        # Info container
+        info_container = QFrame()
+        info_container.setProperty("class", "StepContainer")
+        info_layout = QVBoxLayout(info_container)
+        info_layout.addWidget(self.video_info_label)
+        playlist_layout.addWidget(info_container)
+        
+        # Range selection
+        range_container = QFrame()
+        range_container.setProperty("class", "StepContainer")
+        range_layout = QVBoxLayout(range_container)
+        
+        range_label = QLabel("Select Video Range:")
+        range_label.setProperty("class", "StepTitle")
+        
+        range_inputs = QHBoxLayout()
+        self.start_index = QSpinBox()
+        self.start_index.setMinimum(1)
+        self.start_index.setMaximum(count)
+        self.end_index = QSpinBox()
+        self.end_index.setMinimum(1)
+        self.end_index.setMaximum(count)
+        self.end_index.setValue(count)
+        
+        # Connect value changed signals
+        self.start_index.valueChanged.connect(self.update_selected_count)
+        self.end_index.valueChanged.connect(self.update_selected_count)
+        
+        range_inputs.addWidget(QLabel("From:"))
+        range_inputs.addWidget(self.start_index)
+        range_inputs.addWidget(QLabel("To:"))
+        range_inputs.addWidget(self.end_index)
+        
+        range_layout.addWidget(range_label)
+        range_layout.addLayout(range_inputs)
+        playlist_layout.addWidget(range_container)
+        
+        # Video list
+        video_list = QTextEdit()
+        video_list.setReadOnly(True)
+        for i, title in enumerate(video_titles, 1):
+            video_list.append(f"{i:03d}. {title}")
+        
+        list_container = QFrame()
+        list_container.setProperty("class", "StepContainer")
+        list_layout = QVBoxLayout(list_container)
+        list_layout.addWidget(QLabel("Videos in playlist:"))
+        list_layout.addWidget(video_list)
+        playlist_layout.addWidget(list_container)
+        
+        # Next button
+        next_btn = QPushButton('Next')
+        next_btn.clicked.connect(lambda: self.stack.setCurrentIndex(2))
+        playlist_layout.addWidget(next_btn)
+        
+        # Set the new layout
+        playlist_widget = self.stack.widget(1)
+        QWidget().setLayout(playlist_widget.layout())  # Clear old layout
+        playlist_widget.setLayout(playlist_layout)
+        
+        # Initialize selected count
+        self.update_selected_count()
+
+    def update_selected_count(self):
+        """Update the selected video count based on range selection"""
+        if hasattr(self, 'start_index') and hasattr(self, 'end_index'):
+            start = self.start_index.value()
+            end = self.end_index.value()
+            self.selected_count = end - start + 1
+    
     def start_download(self):
         if not self.check_ffmpeg_installed():
             QMessageBox.critical(self, 'Error', 'ffmpeg is not installed. Please install ffmpeg to proceed.')
@@ -485,35 +741,61 @@ class MainWindow(QMainWindow):
 
         url = self.url_input.text().strip()
         save_path = self.save_path.text().strip()
-        num_videos = 1 if not self.is_playlist else self.count_input.value()
         
-        if not url:
-            QMessageBox.warning(self, 'Error', 'Please enter a URL')
-            return
-        if not save_path:
-            QMessageBox.warning(self, 'Error', 'Please select a save location')
+        if not url or not save_path:
+            QMessageBox.warning(self, 'Error', 'Please enter URL and select save location')
             return
 
+        # Store selected count before clearing UI
+        num_videos = self.selected_count if self.is_playlist else 1
+        start_idx = self.start_index.value() if hasattr(self, 'start_index') else 1
+        end_idx = self.end_index.value() if hasattr(self, 'end_index') else 1
+        
+        # Clear and update UI
+        self.clear_ui_for_download()
+        
+        # Show progress view and hide options
+        self.progress_view.show()
+        self.options_container.hide()
+        
         format_id = self.get_format_id()
         
-        self.download_btn.setEnabled(False)
+        try:
+            self.worker = DownloadWorker(
+                url, 
+                save_path, 
+                format_id, 
+                num_videos,
+                start_index=start_idx,
+                end_index=end_idx,
+                is_playlist=self.is_playlist
+            )
+            self.worker.progress.connect(self.update_progress)
+            self.worker.status.connect(self.update_status)
+            self.worker.detailed_progress.connect(self.update_detailed_progress)
+            self.worker.finished.connect(self.download_finished)
+            self.worker.download_error.connect(self.download_error)
+            self.worker.start()
+        except Exception as e:
+            self.download_error(str(e))
+
+    def clear_ui_for_download(self):
+        """Clear UI and prepare for download"""
+        # Clear progress information
         self.progress_bar.setValue(0)
-        self.status_label.setText('Starting download...')
+        self.status_label.setText('Initializing download...')
         self.detailed_status.clear()
+        self.speed_label.setText('Speed: N/A')
+        self.size_label.setText('Size: N/A')
+        self.video_progress_label.setText('Progress: N/A')
+        self.current_file_label.setText('Current File: N/A')
         
-        self.worker = DownloadWorker(
-            url, 
-            save_path, 
-            format_id, 
-            num_videos,
-            is_playlist=self.is_playlist  # Pass is_playlist flag
-        )
-        self.worker.progress.connect(self.update_progress)
-        self.worker.status.connect(self.update_status)
-        self.worker.detailed_progress.connect(self.update_detailed_progress)  # New connection
-        self.worker.finished.connect(self.download_finished)
-        self.worker.error.connect(self.download_error)
-        self.worker.start()
+        # Disable inputs
+        self.url_input.setEnabled(False)
+        self.validate_btn.setEnabled(False)
+        self.format_combo.setEnabled(False)
+        self.save_path.setEnabled(False)
+        self.download_btn.setEnabled(False)
 
     def get_format_id(self):
         format_map = {
@@ -538,35 +820,72 @@ class MainWindow(QMainWindow):
         )
 
     def update_detailed_progress(self, progress_info):
-        """Update detailed progress information"""
-        self.speed_label.setText(f"{progress_info['speed']}")
-        
-        # Format the size display consistently
-        if progress_info['total'] != 'N/A':
-            size_text = f"{progress_info['downloaded']} / {progress_info['total']} MB"
-        else:
-            size_text = f"{progress_info['downloaded']} MB / Unknown size"
-        self.size_label.setText(size_text)
-        
-        if self.is_playlist:
-            video_progress = f"Video {progress_info['video_num'] + 1} of {self.count_input.value()}"
-            if 'percent' in progress_info:
-                video_progress += f" ({progress_info['percent']})"
-        else:
-            video_progress = progress_info.get('percent', 'N/A')
-            
-        self.video_progress_label.setText(video_progress)
+        """Update progress information with improved formatting"""
+        # Update filename - show only the title
         self.current_file_label.setText(progress_info['filename'])
+        
+        # Update progress percentage
+        self.progress_percent.setText(progress_info['percent'])
+        
+        # Update download speed with icon
+        self.speed_label.setText(f"⚡ {progress_info['speed']}")
+        
+        # Update file size
+        self.size_label.setText(f"📦 {progress_info['downloaded']} / {progress_info['total']}")
+        
+        # Update time remaining
+        self.time_label.setText(f"⏱️ {progress_info['eta']}")
+        
+        # Update video progress for playlists
+        if self.is_playlist:
+            current = progress_info['video_num']
+            total = progress_info['total_videos']
+            self.video_progress_label.setText(f"Video {current} of {total}")
+        
+        # Update status text
+        status = (f"Downloading video {progress_info['video_num']} "
+                f"• {progress_info['speed']} "
+                f"• {progress_info['percent']}")
+        self.status_label.setText(status)
+        
+        # Add to log with timestamp
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.detailed_status.append(
+            f"[{timestamp}] {progress_info['filename']} - "
+            f"{progress_info['percent']} at {progress_info['speed']}"
+        )
 
     def download_finished(self):
+        """Handle download completion"""
+        # Re-enable inputs and restore view
+        self.url_input.setEnabled(True)
+        self.validate_btn.setEnabled(True)
+        self.format_combo.setEnabled(True)
+        self.save_path.setEnabled(True)
         self.download_btn.setEnabled(True)
+        
+        # Show options and hide progress
+        self.options_container.show()
+        self.progress_view.hide()
+        
         self.status_label.setText('Download completed successfully!')
         self.detailed_status.append('Download completed successfully!')
         self.show_completion_dialog(True)
 
     def download_error(self, error):
         """Handle download errors"""
+        # Re-enable inputs and restore view
+        self.url_input.setEnabled(True)
+        self.validate_btn.setEnabled(True)
+        self.format_combo.setEnabled(True)
+        self.save_path.setEnabled(True)
         self.download_btn.setEnabled(True)
+        
+        # Show options and hide progress
+        self.options_container.show()
+        self.progress_view.hide()
+        
         self.status_label.setText('Error occurred during download')
         self.detailed_status.append(f'Error: {error}')
         QMessageBox.critical(self, 'Error', f'Download failed: {error}')
