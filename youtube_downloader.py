@@ -71,21 +71,12 @@ class DownloadWorker(QThread):
             downloaded = d.get('downloaded_bytes', 0)
 
             if total > 0:
-                # Calculate individual video progress
+                # Calculate progress for current video only
                 self.current_video_progress = (downloaded / total) * 100
                 
-                # Calculate overall progress for playlist
-                if self.is_playlist:
-                    video_weight = 100.0 / self.num_videos
-                    base_progress = self.current_video * video_weight
-                    current_part = (self.current_video_progress * video_weight) / 100
-                    self.overall_progress = base_progress + current_part
-                else:
-                    self.overall_progress = self.current_video_progress
-
-                # Smooth progress updates
+                # Use current video progress directly instead of overall progress
                 alpha = 0.1
-                self.smoothed_progress = (alpha * self.overall_progress + 
+                self.smoothed_progress = (alpha * self.current_video_progress + 
                                         (1 - alpha) * self.last_progress)
                 self.last_progress = self.smoothed_progress
                 
@@ -516,7 +507,7 @@ class MainWindow(QMainWindow):
                 background-color: #1a1a1a;
                 border: none;
                 border-radius: 4px;
-                color: #00ff00;
+                color: #ffffff;  // Changed from #00ff00 to #ffffff
                 font-family: 'Consolas', monospace;
                 padding: 10px;
             }
