@@ -6,7 +6,7 @@ from PyQt5.QtGui import QFont, QIcon
 import yt_dlp
 
 class UrlValidator(QThread):
-    finished = pyqtSignal(bool, str, int, list)  # Added list for video titles
+    finished = pyqtSignal(bool, str, int, list, float)  # Added float for duration
     
     def __init__(self, url):
         super().__init__()
@@ -24,6 +24,7 @@ class UrlValidator(QThread):
                 is_playlist = 'entries' in info
                 title = info.get('title', '')
                 video_count = len(info['entries']) if is_playlist else 1
+                duration = info.get('duration', 0) if not is_playlist else 0  # Get video duration in seconds
                 
                 # Get video titles for playlist
                 video_titles = []
@@ -31,9 +32,9 @@ class UrlValidator(QThread):
                     for entry in info['entries']:
                         video_titles.append(entry.get('title', 'Unknown Title'))
                 
-                self.finished.emit(True, title, video_count, video_titles)
+                self.finished.emit(True, title, video_count, video_titles, duration)
         except Exception as e:
-            self.finished.emit(False, str(e), 0, [])
+            self.finished.emit(False, str(e), 0, [], 0)
 
 class DownloadWorker(QThread):
     progress = pyqtSignal(float)
@@ -42,7 +43,7 @@ class DownloadWorker(QThread):
     download_error = pyqtSignal(str)  # Renamed from error to download_error
     detailed_progress = pyqtSignal(dict)  # New signal for detailed progress
 
-    def __init__(self, url, save_path, format_id, num_videos, start_index=1, end_index=None, is_playlist=False):
+    def __init__(self, url, save_path, format_id, num_videos, start_index=1, end_index=None, is_playlist=False, start_time=None, end_time=None):
         super().__init__()
         self.url = url
         self.save_path = save_path
@@ -51,11 +52,12 @@ class DownloadWorker(QThread):
         self.is_playlist = is_playlist
         self.start_index = start_index
         self.end_index = end_index if end_index else num_videos
-        self.current_video = 0  # Track current video number
+        self.start_time = start_time  # Time in seconds
+        self.end_time = end_time  # Time in seconds
+        self.current_video = 0
         self.last_progress = 0
         self.smoothed_progress = 0
         self.progress_history = []
-        self.current_video = 0
         self.total_progress = 0
         self.current_video_progress = 0
         self.overall_progress = 0
@@ -128,9 +130,20 @@ class DownloadWorker(QThread):
                 'progress_hooks': [self.progress_hook],
                 'noplaylist': not self.is_playlist,
                 'playlist_items': f'{self.start_index}-{self.end_index}' if self.is_playlist else None,
-                'logger': self,  # Add this line
+                'logger': self,
             }
-            
+
+            # Add time range processing for single video
+            if not self.is_playlist and (self.start_time is not None or self.end_time is not None):
+                # Add postprocessor for ffmpeg
+                ydl_opts.update({
+                    'postprocessor_args': [
+                        '-ss', str(self.start_time) if self.start_time else '0',
+                        '-t', str(self.end_time - (self.start_time or 0)) if self.end_time else None
+                    ],
+                    'prefer_ffmpeg': True,
+                })
+
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 self.status.emit('Starting download...')
                 ydl.download([self.url])
@@ -138,6 +151,13 @@ class DownloadWorker(QThread):
             self.finished.emit()
         except Exception as e:
             self.download_error.emit(str(e))
+
+    def post_process_hook(self, d):
+        """Handle post-processing progress"""
+        if d['status'] == 'started':
+            self.status.emit(f"Post-processing: {d.get('postprocessor', '')}")
+        elif d['status'] == 'finished':
+            self.status.emit('Post-processing finished')
 
     # Add these methods for logging
     def debug(self, msg):
@@ -626,7 +646,7 @@ class MainWindow(QMainWindow):
         self.validator.finished.connect(self.handle_validation_result)
         self.validator.start()
 
-    def handle_validation_result(self, is_valid, title, count, video_titles):
+    def handle_validation_result(self, is_valid, title, count, video_titles, duration):
         self.validate_btn.setEnabled(True)
         self.validate_btn.setText('Validate URL')
         
@@ -634,15 +654,23 @@ class MainWindow(QMainWindow):
             self.video_count = count
             self.is_playlist = count > 1
             self.video_titles = video_titles
+            self.duration = duration  # Store duration for later use
+            
+            # Format duration for display
+            hours, remainder = divmod(int(duration), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            duration_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
+            
             self.video_info_label.setText(f"Found: {title}\n" +
-                                        (f"Playlist with {count} videos" if self.is_playlist else "Single video"))
+                                        (f"Playlist with {count} videos" if self.is_playlist 
+                                         else f"Single video (Duration: {duration_str})"))
             
             if self.is_playlist:
                 self.setup_playlist_options(count, video_titles)
                 self.stack.setCurrentIndex(1)  # Show playlist options
             else:
-                self.count_input.setValue(1)
-                self.stack.setCurrentIndex(2)  # Skip to download options
+                self.setup_single_video_options(title, duration)
+                self.stack.setCurrentIndex(1)  # Show single video options
         else:
             QMessageBox.warning(self, 'Error', f'Invalid URL: {title}')
 
@@ -725,6 +753,93 @@ class MainWindow(QMainWindow):
             end = self.end_index.value()
             self.selected_count = end - start + 1
     
+    def setup_single_video_options(self, title, duration):
+        """Setup options page for single video download with time range selection"""
+        container = QFrame()
+        container.setProperty("class", "StepContainer")
+        layout = QVBoxLayout(container)
+        
+        # Video info
+        info_label = QLabel(self.video_info_label.text())
+        info_label.setProperty("class", "StepTitle")
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+        
+        # Time range selection
+        time_container = QFrame()
+        time_container.setProperty("class", "StepContainer")
+        time_layout = QVBoxLayout(time_container)
+        
+        time_label = QLabel("Select Time Range (Optional):")
+        time_label.setProperty("class", "StepTitle")
+        time_layout.addWidget(time_label)
+        
+        # Start time selection
+        start_layout = QHBoxLayout()
+        start_layout.addWidget(QLabel("Start Time:"))
+        
+        self.start_hours = QSpinBox()
+        self.start_hours.setRange(0, 23)
+        self.start_hours.setSuffix("h")
+        
+        self.start_minutes = QSpinBox()
+        self.start_minutes.setRange(0, 59)
+        self.start_minutes.setSuffix("m")
+        
+        self.start_seconds = QSpinBox()
+        self.start_seconds.setRange(0, 59)
+        self.start_seconds.setSuffix("s")
+        
+        for widget in [self.start_hours, self.start_minutes, self.start_seconds]:
+            widget.setMinimumWidth(80)
+            start_layout.addWidget(widget)
+        
+        time_layout.addLayout(start_layout)
+        
+        # End time selection
+        end_layout = QHBoxLayout()
+        end_layout.addWidget(QLabel("End Time:"))
+        
+        self.end_hours = QSpinBox()
+        self.end_hours.setRange(0, 23)
+        self.end_hours.setSuffix("h")
+        
+        self.end_minutes = QSpinBox()
+        self.end_minutes.setRange(0, 59)
+        self.end_minutes.setSuffix("m")
+        
+        self.end_seconds = QSpinBox()
+        self.end_seconds.setRange(0, 59)
+        self.end_seconds.setSuffix("s")
+        
+        for widget in [self.end_hours, self.end_minutes, self.end_seconds]:
+            widget.setMinimumWidth(80)
+            end_layout.addWidget(widget)
+        
+        time_layout.addLayout(end_layout)
+        
+        # Set maximum values based on video duration
+        hours, remainder = divmod(int(duration), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        
+        self.end_hours.setValue(hours)
+        self.end_minutes.setValue(minutes)
+        self.end_seconds.setValue(seconds)
+        
+        layout.addWidget(time_container)
+        
+        # Next button
+        next_btn = QPushButton('Next')
+        next_btn.clicked.connect(lambda: self.stack.setCurrentIndex(2))
+        layout.addWidget(next_btn)
+        
+        # Set the new layout
+        page = self.stack.widget(1)
+        QWidget().setLayout(page.layout())  # Clear old layout
+        page.setLayout(QVBoxLayout())
+        page.layout().addWidget(container)
+        page.layout().addStretch()
+
     def start_download(self):
         if not self.check_ffmpeg_installed():
             QMessageBox.critical(self, 'Error', 'ffmpeg is not installed. Please install ffmpeg to proceed.')
@@ -739,6 +854,23 @@ class MainWindow(QMainWindow):
 
         # Store selected count before clearing UI
         num_videos = self.selected_count if self.is_playlist else 1
+        
+        # Get time range for single videos
+        start_time = end_time = None
+        if not self.is_playlist:
+            start_time = (self.start_hours.value() * 3600 + 
+                         self.start_minutes.value() * 60 + 
+                         self.start_seconds.value())
+            end_time = (self.end_hours.value() * 3600 + 
+                       self.end_minutes.value() * 60 + 
+                       self.end_seconds.value())
+            
+            # Validate time range
+            if start_time >= end_time:
+                QMessageBox.warning(self, 'Error', 'End time must be greater than start time')
+                return
+        
+        # Get playlist indices
         start_idx = self.start_index.value() if hasattr(self, 'start_index') else 1
         end_idx = self.end_index.value() if hasattr(self, 'end_index') else 1
         
@@ -759,7 +891,9 @@ class MainWindow(QMainWindow):
                 num_videos,
                 start_index=start_idx,
                 end_index=end_idx,
-                is_playlist=self.is_playlist
+                is_playlist=self.is_playlist,
+                start_time=start_time,
+                end_time=end_time
             )
             self.worker.progress.connect(self.update_progress)
             self.worker.status.connect(self.update_status)
