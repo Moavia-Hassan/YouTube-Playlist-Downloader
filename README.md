@@ -7,6 +7,7 @@ A modern and user-friendly desktop application for downloading YouTube videos an
 ## Features
 
 - 📥 Download single videos or entire playlists from YouTube
+- ⌚ Time range selection for single videos (download specific portions)
 - 📝 Select specific video ranges in playlists
 - 🎥 Multiple quality options (1080p, 720p, 480p, 360p)
 - 🎵 Audio-only download option
@@ -65,6 +66,7 @@ python youtube_downloader.py
    - Paste the YouTube URL in the input field
    - Click "Validate URL" to verify and load video/playlist information
    - For playlists: Select the range of videos you want to download
+   - For single videos: Set the start and end time to download specific portions
    - Choose your preferred video quality
    - Select the save location
    - Click "Start Download"
@@ -83,6 +85,14 @@ python youtube_downloader.py
 - SD 480p
 - SD 360p
 - Audio Only (MP3)
+
+## Time Range Selection
+
+- For single videos, you can now select specific portions to download:
+  - Set start time (hours:minutes:seconds)
+  - Set end time (hours:minutes:seconds)
+  - Video duration is displayed for convenience
+  - Perfect for extracting specific segments from long videos
 
 ## Troubleshooting
 
