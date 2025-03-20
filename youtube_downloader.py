@@ -43,7 +43,7 @@ class DownloadWorker(QThread):
     download_error = pyqtSignal(str)  # Renamed from error to download_error
     detailed_progress = pyqtSignal(dict)  # New signal for detailed progress
 
-    def __init__(self, url, save_path, format_id, num_videos, start_index=1, end_index=None, is_playlist=False, start_time=None, end_time=None):
+    def __init__(self, url, save_path, format_id, num_videos, start_index=1, end_index=None, is_playlist=False, start_time=None, end_time=None, playlist_items=None):
         super().__init__()
         self.url = url
         self.save_path = save_path
@@ -61,6 +61,9 @@ class DownloadWorker(QThread):
         self.total_progress = 0
         self.current_video_progress = 0
         self.overall_progress = 0
+        self.playlist_items = playlist_items
+        self.current_video_index = 0  # Add this to track the actual video index
+        self.total_selected = num_videos  # Store the total number of selected videos
 
     def progress_hook(self, d):
         if d['status'] == 'downloading':
@@ -76,9 +79,12 @@ class DownloadWorker(QThread):
                 # Calculate progress for current video only
                 self.current_video_progress = (downloaded / total) * 100
                 
-                # Use current video progress directly instead of overall progress
+                # Calculate overall progress including all videos
+                overall_progress = ((self.current_video_index * 100) + self.current_video_progress) / self.total_selected
+                
+                # Use smoothing for the progress bar
                 alpha = 0.1
-                self.smoothed_progress = (alpha * self.current_video_progress + 
+                self.smoothed_progress = (alpha * overall_progress + 
                                         (1 - alpha) * self.last_progress)
                 self.last_progress = self.smoothed_progress
                 
@@ -103,22 +109,22 @@ class DownloadWorker(QThread):
             # Get clean filename without path
             filename = os.path.basename(d.get('filename', ''))
             
-            # Update progress info
+            # Update progress info with correct video count
             progress_info = {
                 'speed': speed_str,
                 'downloaded': downloaded_size,
                 'total': total_size,
-                'video_num': self.current_video + 1,
+                'video_num': min(self.current_video_index + 1, self.total_selected),  # Ensure we don't exceed total
                 'filename': filename,
                 'percent': progress_str,
                 'eta': eta_str,
-                'total_videos': self.num_videos
+                'total_videos': self.total_selected
             }
             
             self.detailed_progress.emit(progress_info)
             
         elif d['status'] == 'finished':
-            self.current_video += 1
+            self.current_video_index += 1  # Increment the video index when a video is finished
             self.current_video_progress = 0
             self.status.emit('Processing completed file...')
 
@@ -129,7 +135,7 @@ class DownloadWorker(QThread):
                 'outtmpl': os.path.join(self.save_path, f'%(playlist_index)03d_%(title)s.%(ext)s' if self.is_playlist else '%(title)s.%(ext)s'),
                 'progress_hooks': [self.progress_hook],
                 'noplaylist': not self.is_playlist,
-                'playlist_items': f'{self.start_index}-{self.end_index}' if self.is_playlist else None,
+                'playlist_items': self.playlist_items if self.is_playlist else None,
                 'logger': self,
             }
 
@@ -176,11 +182,27 @@ class DownloadWorker(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.initUI()
+        self.video_info_label = QLabel()  # Initialize QLabel as instance variable
+        self.current_file_label = QLabel()
+        self.speed_label = QLabel()
+        self.size_label = QLabel()
+        self.video_progress_label = QLabel()
+        self.progress_percent = QLabel()
+        self.status_label = QLabel()
+        self.progress_bar = QProgressBar()
+        
+        # Initialize other variables
         self.current_step = 0
         self.video_count = 0
         self.is_playlist = False
-        self.selected_count = 1  # Add this line to store selected count
+        self.selected_count = 1
+        self.selected_videos = []
+        self.video_checkboxes = []
+        self.validator = None
+        self.downloader = None
+        
+        # Setup UI
+        self.initUI()
 
     def initUI(self):
         self.setWindowTitle('YouTube Downloader')
@@ -199,10 +221,10 @@ class MainWindow(QMainWindow):
                 border-radius: 6px;
                 font-size: 14px;
                 font-weight: bold;
+                min-width: 120px;
             }
             QPushButton:hover {
                 background-color: #0056b3;
-                /* Remove transform property as it's not supported */
             }
             QPushButton:disabled {
                 background-color: #cccccc;
@@ -215,20 +237,61 @@ class MainWindow(QMainWindow):
                 color: white;
                 font-size: 14px;
             }
+            QComboBox {
+                padding-right: 20px;  /* Space for the dropdown arrow */
+                min-height: 45px;
+            }
+            QComboBox:drop-down {
+                border: none;
+                width: 30px;
+            }
+            QComboBox:down-arrow {
+                image: url(data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTQiIGhlaWdodD0iOCIgdmlld0JveD0iMCAwIDE0IDgiIGZpbGw9Im5vbmUiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PHBhdGggZD0iTTEgMUw3IDdMMTMgMSIgc3Ryb2tlPSIjZmZmZmZmIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPjwvc3ZnPg==);
+                width: 14px;
+                height: 8px;
+                margin-right: 15px;
+            }
+            QComboBox::drop-down:hover {
+                background-color: #505050;
+                border-top-right-radius: 6px;
+                border-bottom-right-radius: 6px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #2b2b2b;
+                border: 2px solid #505050;
+                border-radius: 6px;
+                selection-background-color: #007BFF;
+                selection-color: white;
+                padding: 8px;
+            }
+            QComboBox QAbstractItemView::item {
+                min-height: 35px;
+                padding: 8px;
+                border-radius: 4px;
+            }
+            QComboBox QAbstractItemView::item:hover {
+                background-color: #3b3b3b;
+            }
             QLineEdit:focus, QComboBox:focus {
                 border: 2px solid #007BFF;
             }
             QProgressBar {
                 border: none;
-                border-radius: 6px;
-                background-color: #3b3b3b;
-                height: 20px;
+                border-radius: 12px;
+                background-color: rgba(59, 59, 59, 0.8);
+                height: 28px;
                 text-align: center;
+                margin: 0px 10px;
                 font-size: 14px;
+                font-weight: bold;
+                color: white;
             }
             QProgressBar::chunk {
-                background-color: #007BFF;
-                border-radius: 6px;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #00c853,
+                    stop:0.5 #00b0ff,
+                    stop:1 #304ffe);
+                border-radius: 12px;
             }
             QLabel {
                 font-size: 14px;
@@ -242,94 +305,51 @@ class MainWindow(QMainWindow):
                 font-size: 14px;
                 padding: 10px;
             }
-            QComboBox {
-                padding: 12px;
-                background-color: #3b3b3b;
+            QGroupBox {
                 border: 2px solid #505050;
-                border-radius: 6px;
-                color: white;
-                font-size: 14px;
+                border-radius: 8px;
+                margin-top: 1em;
+                padding-top: 10px;
             }
-            QComboBox::drop-down {
-                border: none;
-                width: 30px;
+            QGroupBox::title {
+                color: #ffffff;
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
             }
-            QComboBox::down-arrow {
-                image: none;
-                border-left: 5px solid transparent;
-                border-right: 5px solid transparent;
-                border-top: 5px solid #ffffff;
-                width: 0;
-                height: 0;
-                margin-right: 10px;
+            QFrame#downloadProgress {
+                background-color: #1a1a1a;
+                border-radius: 15px;
+                padding: 25px;
+                border: 1px solid #404040;
             }
-            QComboBox QAbstractItemView {
-                background-color: #3b3b3b;
-                color: white;
-                selection-background-color: #007BFF;
-                selection-color: white;
-                border: 1px solid #505050;
-            }
-            QWidget#formatContainer, QWidget#saveContainer {
-                background-color: #363636;
-                border-radius: 10px;
+            QFrame#statusContainer {
+                background-color: #232323;
+                border-radius: 12px;
                 padding: 20px;
-                margin: 10px;
+                border: 1px solid #404040;
             }
-            QSpinBox {
-                min-width: 100px;
-                max-width: 150px;
-            }
-            QFrame.StepContainer {
-                background-color: #363636;
-                border-radius: 10px;
-                padding: 20px;
-                margin: 10px;
-                border: 1px solid #505050;
-            }
-            QFrame.StepContainer:hover {
-                border: 1px solid #007BFF;
-            }
-            QLabel.StepTitle {
-                font-size: 18px;
-                font-weight: bold;
-                color: #007BFF;
-                padding: 5px 0;
-                margin-bottom: 10px;
-            }
-            QPushButton {
-                background-color: #007BFF;
-                color: white;
-                border: none;
-                padding: 12px 25px;
-                border-radius: 6px;
-                font-size: 14px;
-                font-weight: bold;
-                min-width: 120px;
-            }
-            QPushButton:hover {
-                background-color: #0056b3;
-            }
-            QPushButton#downloadBtn {
-                background-color: #28a745;
+            QLabel#statusLabel {
+                color: #4dabf7;
                 font-size: 16px;
-                min-width: 200px;
-            }
-            QPushButton#downloadBtn:hover {
-                background-color: #218838;
-            }
-            QProgressBar {
-                border: none;
-                border-radius: 6px;
-                background-color: #3b3b3b;
-                height: 25px;
-                text-align: center;
-                font-size: 14px;
                 font-weight: bold;
             }
-            QProgressBar::chunk {
-                background-color: #28a745;
-                border-radius: 6px;
+            QLabel#fileLabel {
+                color: #e9ecef;
+                font-size: 15px;
+                margin-bottom: 8px;
+            }
+            QLabel#percentLabel {
+                color: #4dabf7;
+                font-size: 16px;
+                font-weight: bold;
+                min-width: 70px;
+                padding: 0 10px;
+            }
+            QLabel#statsLabel {
+                color: #adb5bd;
+                font-size: 14px;
+                padding: 5px 0;
             }
         """)
 
@@ -647,6 +667,9 @@ class MainWindow(QMainWindow):
         self.validator.start()
 
     def handle_validation_result(self, is_valid, title, count, video_titles, duration):
+        if not self.video_info_label:
+            self.video_info_label = QLabel()
+            
         self.validate_btn.setEnabled(True)
         self.validate_btn.setText('Validate URL')
         
@@ -661,9 +684,17 @@ class MainWindow(QMainWindow):
             minutes, seconds = divmod(remainder, 60)
             duration_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
             
-            self.video_info_label.setText(f"Found: {title}\n" +
-                                        (f"Playlist with {count} videos" if self.is_playlist 
-                                         else f"Single video (Duration: {duration_str})"))
+            try:
+                info_text = f"Found: {title}\n"
+                if self.is_playlist:
+                    info_text += f"Playlist with {count} videos"
+                else:
+                    info_text += f"Single video (Duration: {duration_str})"
+                self.video_info_label.setText(info_text)
+            except RuntimeError:
+                # If the label was deleted, create a new one
+                self.video_info_label = QLabel()
+                self.video_info_label.setText(info_text)
             
             if self.is_playlist:
                 self.setup_playlist_options(count, video_titles)
@@ -720,18 +751,99 @@ class MainWindow(QMainWindow):
         range_layout.addLayout(range_inputs)
         playlist_layout.addWidget(range_container)
         
-        # Video list
-        video_list = QTextEdit()
-        video_list.setReadOnly(True)
-        for i, title in enumerate(video_titles, 1):
-            video_list.append(f"{i:03d}. {title}")
+        # Replace the video list QTextEdit with a scrollable checkbox list
+        videos_container = QFrame()
+        videos_container.setProperty("class", "StepContainer")
+        videos_layout = QVBoxLayout(videos_container)
         
-        list_container = QFrame()
-        list_container.setProperty("class", "StepContainer")
-        list_layout = QVBoxLayout(list_container)
-        list_layout.addWidget(QLabel("Videos in playlist:"))
-        list_layout.addWidget(video_list)
-        playlist_layout.addWidget(list_container)
+        list_label = QLabel("Select videos to download:")
+        list_label.setProperty("class", "StepTitle")
+        videos_layout.addWidget(list_label)
+        
+        # Add select all/none buttons
+        selection_buttons = QHBoxLayout()
+        select_all_btn = QPushButton("Select All")
+        select_none_btn = QPushButton("Select None")
+        select_all_btn.clicked.connect(lambda: self.select_all_videos(True))
+        select_none_btn.clicked.connect(lambda: self.select_all_videos(False))
+        selection_buttons.addWidget(select_all_btn)
+        selection_buttons.addWidget(select_none_btn)
+        videos_layout.addLayout(selection_buttons)
+        
+        # Create scrollable area for checkboxes
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setStyleSheet("""
+            QScrollArea {
+                border: none;
+                background-color: #1a1a1a;
+            }
+            QScrollBar:vertical {
+                background-color: #2b2b2b;
+                width: 10px;
+                border-radius: 5px;
+            }
+            QScrollBar::handle:vertical {
+                background-color: #404040;
+                min-height: 30px;
+                border-radius: 5px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background-color: #505050;
+            }
+        """)
+        
+        checkbox_widget = QWidget()
+        checkbox_layout = QVBoxLayout(checkbox_widget)
+        checkbox_widget.setStyleSheet("""
+            QWidget {
+                background-color: #1a1a1a;
+            }
+            QCheckBox {
+                color: white;
+                padding: 5px;
+                spacing: 8px;
+                font-size: 14px;
+            }
+            QCheckBox:hover {
+                background-color: #2b2b2b;
+                border-radius: 4px;
+            }
+            QCheckBox::indicator {
+                width: 20px;
+                height: 20px;
+                border-radius: 4px;
+            }
+            QCheckBox::indicator:unchecked {
+                border: 2px solid #505050;
+                background-color: #2b2b2b;
+            }
+            QCheckBox::indicator:unchecked:hover {
+                border-color: #007BFF;
+            }
+            QCheckBox::indicator:checked {
+                border: 2px solid #007BFF;
+                background-color: #2b2b2b;
+                background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24'%3E%3Cpath d='M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41L9 16.17z' fill='%23007BFF'/%3E%3C/svg%3E");
+                background-repeat: no-repeat;
+                background-position: center;
+            }
+        """)
+        
+        self.video_checkboxes = []  # Clear existing checkboxes
+        
+        # Create checkboxes for videos
+        for i, title in enumerate(video_titles, 1):
+            checkbox = QCheckBox(f"{i}. {title}")
+            checkbox.setChecked(True)  # Default checked
+            checkbox.setObjectName(f"video_{i}")
+            checkbox.stateChanged.connect(self.update_selected_videos)
+            self.video_checkboxes.append(checkbox)
+            checkbox_layout.addWidget(checkbox)
+        
+        scroll_area.setWidget(checkbox_widget)
+        videos_layout.addWidget(scroll_area)
+        playlist_layout.addWidget(videos_container)
         
         # Next button
         next_btn = QPushButton('Next')
@@ -743,9 +855,22 @@ class MainWindow(QMainWindow):
         QWidget().setLayout(playlist_widget.layout())  # Clear old layout
         playlist_widget.setLayout(playlist_layout)
         
-        # Initialize selected count
-        self.update_selected_count()
+        # Initialize selected videos
+        self.update_selected_videos()
 
+    def select_all_videos(self, select=True):
+        """Select or deselect all videos"""
+        for checkbox in self.video_checkboxes:
+            checkbox.setChecked(select)
+    
+    def update_selected_videos(self):
+        """Update the list of selected video indices"""
+        self.selected_videos = []
+        for i, checkbox in enumerate(self.video_checkboxes, 1):
+            if checkbox.isChecked():
+                self.selected_videos.append(i)
+        self.selected_count = len(self.selected_videos)
+    
     def update_selected_count(self):
         """Update the selected video count based on range selection"""
         if hasattr(self, 'start_index') and hasattr(self, 'end_index'):
@@ -884,16 +1009,18 @@ class MainWindow(QMainWindow):
         format_id = self.get_format_id()
         
         try:
+            selected_indices = ','.join(map(str, self.selected_videos)) if self.is_playlist else None
             self.worker = DownloadWorker(
                 url, 
                 save_path, 
                 format_id, 
-                num_videos,
+                len(self.selected_videos) if self.is_playlist else 1,
                 start_index=start_idx,
                 end_index=end_idx,
                 is_playlist=self.is_playlist,
                 start_time=start_time,
-                end_time=end_time
+                end_time=end_time,
+                playlist_items=selected_indices if self.is_playlist else None
             )
             self.worker.progress.connect(self.update_progress)
             self.worker.status.connect(self.update_status)
@@ -934,7 +1061,39 @@ class MainWindow(QMainWindow):
         return format_map.get(self.format_combo.currentIndex(), 'bestvideo+bestaudio/best')
 
     def update_progress(self, value):
-        self.progress_bar.setValue(int(value))
+        """Enhanced smooth progress bar animation"""
+        current = self.progress_bar.value()
+        if value > current:
+            # Use a more sophisticated smoothing algorithm
+            alpha = 0.12  # Reduced smoothing factor for smoother animation
+            beta = 0.02   # Secondary smoothing for very small changes
+            
+            # Calculate primary smoothing
+            primary_smooth = current + (value - current) * alpha
+            
+            # Apply secondary smoothing for small changes
+            if value - current < 5:
+                smoothed_value = current + (value - current) * beta
+            else:
+                smoothed_value = primary_smooth
+            
+            # Ensure we don't overshoot
+            smoothed_value = min(smoothed_value, value)
+            
+            # Update progress bar
+            self.progress_bar.setValue(int(smoothed_value))
+            
+            # Format percentage with one decimal place
+            percentage = f"{smoothed_value:.1f}%"
+            self.progress_bar.setFormat(percentage)
+            self.progress_percent.setText(percentage)
+            
+            # If we're very close to the target, snap to it
+            if value - smoothed_value < 0.2:
+                self.progress_bar.setValue(int(value))
+                percentage = f"{value:.1f}%"
+                self.progress_bar.setFormat(percentage)
+                self.progress_percent.setText(percentage)
 
     def update_status(self, status):
         self.status_label.setText(status)
@@ -945,41 +1104,75 @@ class MainWindow(QMainWindow):
         )
 
     def update_detailed_progress(self, progress_info):
-        """Update progress information with improved formatting"""
-        # Update filename - show only the title
-        self.current_file_label.setText(progress_info['filename'])
+        """Enhanced progress information display"""
+        speed = progress_info.get('speed', 'N/A')
+        downloaded = progress_info.get('downloaded', '0')
+        total = progress_info.get('total', 'Unknown')
+        video_num = progress_info.get('video_num', 1)
+        total_videos = progress_info.get('total_videos', 1)
+        filename = progress_info.get('filename', '')
+        eta = progress_info.get('eta', 'Calculating...')
+
+        # Create a modern, card-style progress status with enhanced styling
+        status_text = f"""
+        <div style='
+            background-color: #2d2d2d;
+            padding: 20px;
+            border-radius: 12px;
+            margin: 8px;
+            border: 1px solid #404040;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+        '>
+            <div style='
+                background-color: #1a1a1a;
+                padding: 12px;
+                border-radius: 8px;
+                margin-bottom: 15px;
+                border: 1px solid #333;
+            '>
+                <p style='
+                    margin: 0;
+                    color: #00e676;
+                    font-size: 15px;
+                    font-weight: bold;
+                '>⬇️ {filename}</p>
+            </div>
+            <div style='
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 12px;
+            '>
+                <p style='
+                    margin: 5px 0;
+                    color: #00b0ff;
+                    font-size: 14px;
+                '>📊 Video {video_num} of {total_videos}</p>
+                <p style='
+                    margin: 5px 0;
+                    color: #00b0ff;
+                    font-size: 14px;
+                '>🚀 {speed}</p>
+                <p style='
+                    margin: 5px 0;
+                    color: #00b0ff;
+                    font-size: 14px;
+                '>📦 {downloaded} MB / {total}</p>
+                <p style='
+                    margin: 5px 0;
+                    color: #00b0ff;
+                    font-size: 14px;
+                '>⏱️ {eta}</p>
+            </div>
+        </div>
+        """
         
-        # Update progress percentage
-        self.progress_percent.setText(progress_info['percent'])
+        self.status_label.setText(status_text)
         
-        # Update download speed with icon
-        self.speed_label.setText(f"⚡ {progress_info['speed']}")
-        
-        # Update file size
-        self.size_label.setText(f"📦 {progress_info['downloaded']} / {progress_info['total']}")
-        
-        # Update time remaining
-        self.time_label.setText(f"⏱️ {progress_info['eta']}")
-        
-        # Update video progress for playlists
-        if self.is_playlist:
-            current = progress_info['video_num']
-            total = progress_info['total_videos']
-            self.video_progress_label.setText(f"Video {current} of {total}")
-        
-        # Update status text
-        status = (f"Downloading video {progress_info['video_num']} "
-                f"• {progress_info['speed']} "
-                f"• {progress_info['percent']}")
-        self.status_label.setText(status)
-        
-        # Add to log with timestamp
-        from datetime import datetime
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.detailed_status.append(
-            f"[{timestamp}] {progress_info['filename']} - "
-            f"{progress_info['percent']} at {progress_info['speed']}"
-        )
+        # Update individual labels with modern styling
+        self.current_file_label.setText(f"<span style='color: #00e676;'>⬇️ {filename}</span>")
+        self.speed_label.setText(f"<span style='color: #00b0ff;'>🚀 {speed}</span>")
+        self.size_label.setText(f"<span style='color: #00b0ff;'>📦 {downloaded} MB / {total}</span>")
+        self.video_progress_label.setText(f"<span style='color: #00b0ff;'>📊 Video {video_num} of {total_videos}</span>")
 
     def download_finished(self):
         """Handle download completion"""
