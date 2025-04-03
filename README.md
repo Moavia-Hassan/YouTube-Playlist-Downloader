@@ -1,4 +1,4 @@
-# YouTube Downloader
+# YouTube Master
 
 A modern and user-friendly desktop application for downloading YouTube videos and playlists with an intuitive graphical interface.
 
